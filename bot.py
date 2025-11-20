@@ -185,11 +185,7 @@ async def receive_cookie_file(update, context):
 # MAIN DOWNLOAD PROCESS
 # ======================================================
 async def handle_message(update, context):
-    if cookies_expired():
-        await update.message.reply_text(
-            "❌ Cookies expired.\nPlease contact SVY."
-        )
-        return
+   
 
     text = update.message.text
     chat_id = update.message.chat_id
@@ -279,3 +275,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
