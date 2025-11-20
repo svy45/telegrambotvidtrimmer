@@ -4,6 +4,9 @@ import subprocess
 import re
 from pathlib import Path
 import telegram
+from threading import Thread
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -17,7 +20,7 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TEMP_DIR = Path("temp_downloads/")
 COOKIES_FILE = "yt_cookies.txt"
-MAX_SIZE = 1900 * 1024 * 1024
+MAX_SIZE = 1900 * 1024 * 1024  # 1.9GB
 
 TEMP_DIR.mkdir(exist_ok=True)
 
@@ -32,12 +35,12 @@ if cookies_b64:
         decoded = base64.b64decode(cookies_b64).decode()
         with open(COOKIES_FILE, "w") as f:
             f.write(decoded)
-        cookies_preview = decoded[:500]
+        cookies_preview = decoded[:600]
         print("✔ Cookies loaded.")
     except Exception as e:
         print("❌ Cookie decode error:", e)
 else:
-    print("⚠ No cookies loaded (restricted videos may fail).")
+        print("⚠ No cookies loaded.")
 
 # ============================================
 # REGEX
@@ -47,34 +50,33 @@ TIME_RE = re.compile(
     r"(\d{1,2}:)?\d{1,2}:\d{2}-(\d{1,2}:)?\d{1,2}:\d{2}|(\d{1,2}:)?\d{1,2}:\d{2}-inf"
 )
 
+# ============================================
+# KEEP-ALIVE SERVER (prevents Fly.io sleep)
+# ============================================
+def keep_alive():
+    server = HTTPServer(("0.0.0.0", 8080), SimpleHTTPRequestHandler)
+    server.serve_forever()
+
 
 # ============================================
-# START COMMAND (PERSONALIZED)
+# START COMMAND
 # ============================================
 async def start(update, context):
     user = update.effective_user
-
-    name = (
-        user.first_name
-        or user.username
-        or "there"
-    )
+    name = user.first_name or user.username or "there"
 
     await update.message.reply_text(
         f"👋 Hi *{name}*, welcome to my bot!\n\n"
-        "Send your YouTube link in ANY flexible format.\n\n"
-        "📄 *Document Output (Best Quality)*\n"
-        "`https://youtu.be/abc123 1:00-2:00 -ft doc`\n"
-        "`-ft doc https://youtu.be/abc123 1:00:00-1:05:00`\n\n"
-        "🎬 *Video Output (Streamable)*\n"
+        "Send a YouTube link in ANY flexible format:\n\n"
+        "📄 *Document Output*\n"
+        "`https://youtu.be/abc123 1:00-2:00 -ft doc`\n\n"
+        "🎬 *Video Output*\n"
         "`https://youtu.be/abc123 -ft video 00:01:00-00:02:00`\n\n"
-        "🕒 *Supports:*\n"
-        "`M:SS`, `MM:SS`, `H:MM:SS`, `HH:MM:SS`, `1:00:00-inf`\n\n"
-        "⚙ If no `-ft` is provided → output = *Document*.\n\n"
+        "🕒 Supports: `M:SS`, `H:MM:SS`, `1:00:00-inf`\n\n"
+        "⚙ Default output: *Document*\n\n"
         "*BY SVY*",
         parse_mode="Markdown"
     )
-
 
 
 # ============================================
@@ -91,13 +93,12 @@ async def checkcookies(update, context):
 
 
 # ============================================
-# MAIN MESSAGE HANDLER
+# MESSAGE HANDLER
 # ============================================
 async def handle_message(update, context):
     text = update.message.text
     chat_id = update.message.chat_id
 
-    # Detect YouTube URL
     url_match = YOUTUBE_URL_RE.search(text)
     if not url_match:
         await update.message.reply_text("❌ Please send a valid YouTube URL.")
@@ -105,12 +106,12 @@ async def handle_message(update, context):
 
     video_url = url_match.group(1)
 
-    # Detect trimming time
+    # Time range
     time_match = TIME_RE.search(text)
     time_seg = time_match.group(0) if time_match else None
 
-    # Detect output format
-    choice = "doc"  # default
+    # Format
+    choice = "doc"
     if "-ft video" in text.lower():
         choice = "video"
     elif "-ft doc" in text.lower():
@@ -125,9 +126,6 @@ async def handle_message(update, context):
         parse_mode="Markdown"
     )
 
-    # ============================================
-    # RUN YT-DLP
-    # ============================================
     try:
         command = [
             "yt-dlp",
@@ -161,19 +159,17 @@ async def handle_message(update, context):
             await update.message.reply_text("❌ Output file missing.")
             return
 
-        # ============================================
-        # SEND AS DOCUMENT OR VIDEO
-        # ============================================
+        # SEND FILE
         with open(output_path, "rb") as f:
             if choice == "doc":
                 await update.message.reply_document(
                     document=f,
-                    caption="📄 Sent as Document (Best Quality)"
+                    caption="📄 Document (Best Quality)"
                 )
             else:
                 await update.message.reply_video(
                     video=f,
-                    caption="🎬 Sent as Video",
+                    caption="🎬 Video Output",
                     supports_streaming=True
                 )
 
@@ -189,6 +185,8 @@ async def handle_message(update, context):
 # MAIN
 # ============================================
 def main():
+    Thread(target=keep_alive).start()   # Prevent Fly.io sleep
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
