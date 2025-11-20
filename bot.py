@@ -1,29 +1,31 @@
 import os
 import base64
-import subprocess
-import re
-from pathlib import Path
 import telegram
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    filters
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
+import subprocess
+import re
+from pathlib import Path
 
-# ============================================
+# ========================================
 # CONFIG
-# ============================================
+# ========================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TEMP_DIR = Path("temp_downloads/")
-COOKIES_FILE = "yt_cookies.txt"
-MAX_SIZE = 1900 * 1024 * 1024
+MAX_SIZE = 1900 * 1024 * 1024  # Telegram ~2GB limit
 
 TEMP_DIR.mkdir(exist_ok=True)
 
-# ============================================
-# DECODE BASE64 COOKIES
-# ============================================
+# ========================================
+# LOAD COOKIES (Base64 -> File)
+# ========================================
+COOKIES_FILE = "yt_cookies.txt"
 cookies_b64 = os.getenv("YT_COOKIES_BASE64")
 cookies_preview = ""
 
@@ -33,104 +35,174 @@ if cookies_b64:
         with open(COOKIES_FILE, "w") as f:
             f.write(decoded)
         cookies_preview = decoded[:500]
-        print("✔ Cookies loaded.")
+        print("✔ Cookies Loaded. Preview:", cookies_preview)
     except Exception as e:
-        print("❌ Cookie decode error:", e)
+        print("❌ Cookie Decode Error:", e)
 else:
-    print("⚠ No cookies loaded (restricted videos may fail).")
+    print("⚠ No cookies loaded.")
 
-# ============================================
-# REGEX (URL + H:MM:SS Support)
-# ============================================
-YOUTUBE_URL_RE = re.compile(r"(https?://\S+)")
-TIME_RE = re.compile(
-    r"(\d{1,2}:)?\d{1,2}:\d{2}-(\d{1,2}:)?\d{1,2}:\d{2}|(\d{1,2}:)?\d{1,2}:\d{2}-inf"
+# ========================================
+# TIME RANGE REGEX (supports H:MM:SS)
+# ========================================
+COMMAND_PATTERN = re.compile(
+    r"(\bhttps?://\S+)\s*((\d{1,2}:)?\d{1,2}:\d{2}-(\d{1,2}:)?\d{1,2}:\d{2}|(\d{1,2}:)?\d{1,2}:\d{2}-inf)?"
 )
 
+# Store user's default sending format
+user_default_format = {}  # chat_id: "doc" or "video"
 
-# ============================================
-# START MESSAGE
-# ============================================
+# ========================================
+# /start COMMAND
+# ========================================
 async def start(update, context):
     await update.message.reply_text(
-        "👋 *Welcome to QuickFacts Video Bot!*\n\n"
-        "Send me your YouTube link in ANY of these formats:\n\n"
-
-        "📄 *Document Output (best)*\n"
-        "`https://youtu.be/abc123 1:00-2:00 -ft doc`\n"
-        "`-ft doc https://youtu.be/abc123 1:00:00-1:05:00`\n\n"
-
-        "🎬 *Video Output*\n"
-        "`https://youtu.be/abc123 -ft video 1:20-2:00`\n\n"
-
-        "🕒 *Time Formats Supported:*\n"
-        "`M:SS`\n`MM:SS`\n`H:MM:SS`\n`HH:MM:SS`\n`1:00:00-inf`\n\n"
-
-        "⚙ If no `-ft` is provided → default is *document*.\n",
+        "👋 Welcome to the QuickFacts Video Bot!\n\n"
+        "Send me a YouTube link + optional time range.\n\n"
+        "🕒 **Supported time formats:**\n"
+        "- `M:SS`\n"
+        "- `MM:SS`\n"
+        "- `H:MM:SS`\n"
+        "- `HH:MM:SS`\n"
+        "- `1:00:00-inf` (until end)\n\n"
+        "📌 **Examples:**\n"
+        "`https://youtu.be/abc 0:30-1:00`\n"
+        "`https://youtu.be/abc 1:02:20-1:10:00`\n"
+        "`https://youtu.be/abc 00:10-02:00`\n"
+        "`https://youtu.be/abc 1:00:00-inf`\n\n"
+        "⚙️ Set a default format:\n"
+        "`/format document`\n"
+        "`/format video`\n",
         parse_mode="Markdown"
     )
 
+# ========================================
+# /format COMMAND (set default)
+# ========================================
+async def set_format(update, context):
+    chat_id = update.effective_chat.id
 
-# ============================================
-# CHECK COOKIES
-# ============================================
+    if not context.args:
+        await update.message.reply_text("Use: /format document  OR  /format video")
+        return
+
+    choice = context.args[0].lower()
+
+    if choice not in ["document", "video"]:
+        await update.message.reply_text("❌ Choose: document OR video")
+        return
+
+    user_default_format[chat_id] = "doc" if choice == "document" else "video"
+
+    await update.message.reply_text(
+        f"✔ Default format saved: **{choice.capitalize()}**",
+        parse_mode="Markdown"
+    )
+
+# ========================================
+# /checkcookies COMMAND
+# ========================================
 async def checkcookies(update, context):
     if cookies_preview:
         await update.message.reply_text(
-            f"🧪 *Cookies preview:*\n\n{cookies_preview}",
+            f"🧪 **Cookies Preview:**\n{cookies_preview}",
             parse_mode="Markdown"
         )
     else:
         await update.message.reply_text("❌ No cookies loaded.")
 
+# ========================================
+# BUTTON HANDLER (doc/video)
+# ========================================
+async def format_choice_handler(update, context):
+    query = update.callback_query
+    await query.answer()
 
-# ============================================
-# MAIN MESSAGE HANDLER
-# ============================================
+    choice, chat_id = query.data.split("|")
+    context.user_data["chosen_format"] = choice
+
+    await query.edit_message_text(
+        f"✔ Selected: {'Document' if choice=='doc' else 'Video'}\n"
+        "⏳ Downloading..."
+    )
+
+    await process_video(query, context)
+
+# ========================================
+# MAIN INPUT HANDLER
+# ========================================
 async def handle_message(update, context):
     text = update.message.text
     chat_id = update.message.chat_id
+    match = COMMAND_PATTERN.match(text)
 
-    # Detect URL
-    url_match = YOUTUBE_URL_RE.search(text)
-    if not url_match:
-        await update.message.reply_text("❌ Please send a valid YouTube URL.")
+    if not match:
+        await update.message.reply_text(
+            "❌ Invalid input.\n\nUse:\n"
+            "`URL H:MM:SS-H:MM:SS`\n\nExample:\n"
+            "`https://youtu.be/xyz 1:00:00-1:05:20`",
+            parse_mode="Markdown"
+        )
         return
 
-    video_url = url_match.group(1)
+    video_url = match.group(1)
+    time_seg = match.group(2)
 
-    # Detect time range
-    time_match = TIME_RE.search(text)
-    time_seg = time_match.group(0) if time_match else None
+    context.user_data["pending_url"] = video_url
+    context.user_data["pending_seg"] = time_seg
 
-    # Detect output type: doc or video
-    choice = "doc"  # default
-    if "-ft doc" in text.lower():
-        choice = "doc"
-    elif "-ft video" in text.lower():
-        choice = "video"
+    # If user has default format, skip asking
+    if chat_id in user_default_format:
+        context.user_data["chosen_format"] = user_default_format[chat_id]
+        await update.message.reply_text(
+            f"Using default format: {user_default_format[chat_id]}"
+        )
+        return await process_video(update, context)
 
-    # File path
-    output_path = TEMP_DIR / f"{chat_id}_output.mp4"
+    # Ask user which format to send
+    keyboard = [
+        [
+            telegram.InlineKeyboardButton("📄 Document", callback_data=f"doc|{chat_id}"),
+            telegram.InlineKeyboardButton("🎬 Video", callback_data=f"video|{chat_id}")
+        ]
+    ]
 
     await update.message.reply_text(
-        f"⏳ Processing your request...\n"
-        f"Format: *{choice}*\n"
-        f"Trimming: *{time_seg or 'Full Video'}*",
-        parse_mode="Markdown"
+        "📌 How should I send the output?",
+        reply_markup=telegram.InlineKeyboardMarkup(keyboard)
     )
 
-    # ============================================
-    # RUN YT-DLP
-    # ============================================
+# ========================================
+# PROCESS VIDEO (DOWNLOAD & SEND)
+# ========================================
+async def process_video(update, context):
+
+    # Determine if update came from callback or message
+    if isinstance(update, telegram.CallbackQuery):
+        chat_id = update.message.chat_id
+        send = update.message.reply_text
+        reply_document = update.message.reply_document
+        reply_video = update.message.reply_video
+    else:
+        chat_id = update.message.chat_id
+        send = update.message.reply_text
+        reply_document = update.message.reply_document
+        reply_video = update.message.reply_video
+
+    video_url = context.user_data.get("pending_url")
+    time_seg = context.user_data.get("pending_seg")
+    choice = context.user_data.get("chosen_format", "doc")
+
+    output_file = TEMP_DIR / f"{chat_id}_video.mp4"
+
     try:
+        # Build yt-dlp command
         command = [
             "yt-dlp",
             "--cookies", COOKIES_FILE,
             "--extractor-args", "youtube:player_client=default",
             "--format", "bestvideo+bestaudio/best",
             "--merge-output-format", "mp4",
-            "--output", str(output_path),
+            "--output", str(output_file),
         ]
 
         if time_seg:
@@ -138,59 +210,56 @@ async def handle_message(update, context):
 
         command.append(video_url)
 
-        result = subprocess.run(
-            command, capture_output=True, text=True, timeout=600
-        )
+        # Run command
+        result = subprocess.run(command, capture_output=True, text=True, timeout=600)
 
+        print("===== YT-DLP LOG =====")
         print("STDERR:", result.stderr)
         print("STDOUT:", result.stdout)
+        print("======================")
 
         if result.returncode != 0:
-            await update.message.reply_text(
-                f"❌ *Download failed:*\n```\n{result.stderr[:1500]}\n```",
-                parse_mode="Markdown"
-            )
+            await send("❌ Download failed:\n" + result.stderr[:1500])
             return
 
-        if not output_path.exists():
-            await update.message.reply_text("❌ Output file missing.")
+        if not output_file.exists():
+            await send("❌ Output file missing.")
             return
 
-        # ============================================
-        # SEND FILE BASED ON FORMAT
-        # ============================================
-        with open(output_path, "rb") as f:
+        # SEND FILE
+        with open(output_file, "rb") as f:
             if choice == "doc":
-                await update.message.reply_document(
+                await reply_document(
                     document=f,
-                    caption="📄 Sent as Document (Best Quality)"
+                    caption="📄 Document (Best Quality)"
                 )
             else:
-                await update.message.reply_video(
+                await reply_video(
                     video=f,
-                    caption="🎬 Sent as Video",
+                    caption="🎬 Video",
                     supports_streaming=True
                 )
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+        await send(f"❌ Error: {e}")
 
     finally:
-        if output_path.exists():
-            os.remove(output_path)
+        if output_file.exists():
+            os.remove(output_file)
 
-
-# ============================================
+# ========================================
 # START BOT
-# ============================================
+# ========================================
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("format", set_format))
     app.add_handler(CommandHandler("checkcookies", checkcookies))
+    app.add_handler(CallbackQueryHandler(format_choice_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🤖 Bot running…")
+    print("🤖 Bot is running…")
     app.run_polling(poll_interval=3)
 
 
